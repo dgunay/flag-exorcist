@@ -5,29 +5,47 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/samber/mo"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
+	"golang.org/x/tools/go/ast/inspector"
 )
 
 type Config struct {
 	// The symbols that the user wants to look at
-	FlagSymbols []string `env:"FLAG_SYMBOLS" env-required:true`
+	FlagSymbols []string `env:"FLAG_SYMBOLS" env-required:"true"`
 
 	// Cutoff date for when a flag is considered old
-	Cutoff time.Time `env:"CUTOFF" env-default:"2019-01-01"`
+	Cutoff time.Time `env:"CUTOFF" env-default:"2019-01-01T00:00:00Z"`
 
 	// Log level to log at
-	LogLevel zerolog.Level `env:"LOG_LEVEL" env-default:"info"`
+	LogLevel loglevel `env:"LOG_LEVEL" env-default:"info"`
+
+	RepoPath string `env:"REPO_PATH" env-default:"."`
+}
+
+type loglevel zerolog.Level
+
+func (l *loglevel) SetValue(s string) error {
+	lvl, err := zerolog.ParseLevel(s)
+	if err != nil {
+		return err
+	}
+	*l = loglevel(lvl)
+	return nil
 }
 
 type runner struct {
 	cfg Config
+	l   zerolog.Logger
 }
 
 var r runner
@@ -43,61 +61,124 @@ var Analyzer *analysis.Analyzer = &analysis.Analyzer{
 
 func Initialize(cfg Config) {
 	r.cfg = cfg
+	r.l = log.Logger.Level(zerolog.Level(cfg.LogLevel))
 }
 
+const Cutoff = "yeet"
+
 func (r *runner) run(pass *analysis.Pass) (any, error) {
+	r.l.Debug().Str("package", pass.Pkg.Name()).Msg("Running flagexorcist on package")
+
+	// Get the git repo
+	r.l.Debug().Str("path", r.cfg.RepoPath).Msg("Opening git repo")
+	repo, err := git.PlainOpen(r.cfg.RepoPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "open git repo")
+	}
+
 	identifiers := r.findFlagIdents(pass)
 
-	timesCommmitted := map[*ast.Ident]time.Time{}
-
-	// We find all usages of those symbols
+	// sort these into declarations and usages
+	declarationsAndCommitTimes := map[*ast.Ident]time.Time{}
+	usagesByFlag := map[string][]*ast.Ident{}
 	for _, id := range identifiers {
-		use := pass.TypesInfo.Uses[id]
-		pos := pass.Fset.Position(use.Pos())
-		if timeCommitted(id.Name, pos).Before(r.cfg.Cutoff) {
+		if isDeclaration(id) {
+			timeCommitted := r.timeCommitted(repo, id.Name, pass.Fset.Position(id.NamePos))
+			if t := timeCommitted.OrEmpty(); !t.IsZero() {
+				declarationsAndCommitTimes[id] = t
+			}
+		} else {
+			usagesByFlag[id.Name] = append(usagesByFlag[id.Name], id)
 		}
 	}
 
+	if time.Now() == r.cfg.Cutoff {
+		r.l.Debug().Msg("Cutoff is now")
+	}
+
+	if Cutoff == "yeet" {
+		r.l.Debug().Msg("Cutoff is yeet")
+	}
+
 	// We complain if any used symbol is very old
+	for id, committedAt := range declarationsAndCommitTimes {
+		usages, ok := usagesByFlag[id.Name]
+		if !ok {
+			continue
+		}
+
+		for _, usage := range usages {
+			if committedAt.Before(r.cfg.Cutoff) {
+				pass.Reportf(usage.Pos(), "flag '%v', added on %v, was used on after %v", id.Name, committedAt, r.cfg.Cutoff)
+			}
+		}
+
+	}
 
 	return nil, nil
 }
 
-func (r *runner) findFlagIdents(pass *analysis.Pass) map[string]*ast.Ident {
-	idents := map[string]*ast.Ident{}
+func (r *runner) findFlagIdents(pass *analysis.Pass) []*ast.Ident {
+	idents := []*ast.Ident{}
 
-	// Find the identifiers for the symbols we care about
-	for _, file := range pass.Files {
-		ast.Inspect(file, func(n ast.Node) bool {
-			// We only care about flag declarations
-			id, ok := n.(*ast.Ident)
-			if !ok {
-				return true
-			}
-
-			for _, symbol := range r.cfg.FlagSymbols {
-				// TODO: disambiguate between packages
-
-				if _, exists := idents[symbol]; id.Name == symbol && !exists {
-					idents[symbol] = id
-				}
-			}
-
-			return true
-		})
+	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	nodeFilter := []ast.Node{
+		(*ast.Ident)(nil),
 	}
+	inspect.Preorder(nodeFilter, func(node ast.Node) {
+		id := node.(*ast.Ident)
+		for _, symbol := range r.cfg.FlagSymbols {
+			// TODO: disambiguate between packages
+
+			if id.Name == symbol {
+				r.l.Debug().
+					Str("symbol", symbol).
+					Any("pos", pass.Fset.Position(id.NamePos)).
+					Msg("Found usage or declaration of flag symbol")
+
+				idents = append(idents, id)
+			}
+		}
+	})
 
 	return idents
 }
 
+func isDeclaration(ident *ast.Ident) bool {
+	if ident.Obj == nil {
+		// The identifier doesn't have an object, it is not a declaration.
+		return false
+	}
+
+	switch parent := ident.Obj.Decl.(type) {
+	case *ast.ValueSpec:
+		// The identifier is part of a const/var declaration.
+		// Check if it's the first name in the list.
+		for i, name := range parent.Names {
+			if ident == name {
+				return i == 0
+			}
+		}
+	case *ast.Field:
+		// The identifier is part of a struct field declaration.
+		return ident == parent.Names[0]
+	}
+
+	return false
+}
+
 // Given some symbol, find the commit where it was added and return the Time of
 // the commit.
-func (r *runner) timeCommitted(repo *git.Repository, symbol string, pos token.Position) mo.Option[time.Time] {
+func (r *runner) timeCommitted(
+	repo *git.Repository, symbol string, pos token.Position,
+) mo.Option[time.Time] {
 	iter, err := repo.Log(&git.LogOptions{Until: &r.cfg.Cutoff})
 	if err != nil {
 		panic(err) // TODO:
 		return mo.None[time.Time]()
 	}
+
+	timestamp := mo.None[time.Time]()
 
 	iter.ForEach(func(commit *object.Commit) error {
 		// Get the list of files changed in this commit
@@ -109,8 +190,8 @@ func (r *runner) timeCommitted(repo *git.Repository, symbol string, pos token.Po
 		// Search for the given file in the list of changed files
 		var file *object.File
 		for _, f := range patch.Stats() {
-			if f.To.Name == "/path/to/myfile.txt" {
-				file, err = commit.File(f.To.Name)
+			if f.Name == pos.Filename {
+				file, err = commit.File(f.Name)
 				if err != nil {
 					return err
 				}
@@ -124,14 +205,17 @@ func (r *runner) timeCommitted(repo *git.Repository, symbol string, pos token.Po
 			if err != nil {
 				return err
 			}
-			if symbolRegex.MatchString(contents) {
+			if strings.Contains(contents, symbol) {
 				// The symbol was found in this commit, so return the commit timestamp
-				fmt.Printf("Symbol found in commit %v\n", parent.Hash)
-				fmt.Printf("Symbol was added on %v\n", parent.Author.When)
+				fmt.Printf("Symbol found in commit %v\n", commit.Hash)
+				fmt.Printf("Symbol was added on %v\n", commit.Author.When)
+				timestamp = mo.Some[time.Time](commit.Author.When)
 				return nil
 			}
 		}
 
 		return nil
 	})
+
+	return timestamp
 }

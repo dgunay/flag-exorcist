@@ -6,6 +6,7 @@ require (
 	github.com/go-git/go-git v4.7.0+incompatible
 	github.com/go-git/go-git/v5 v5.6.1
 	github.com/ilyakaznacheev/cleanenv v1.4.2
+	github.com/pkg/errors v0.9.1
 	github.com/rotisserie/eris v0.5.4
 	github.com/rs/zerolog v1.29.1
 	github.com/samber/mo v1.8.0
