@@ -1,10 +1,10 @@
 package flagexorcist
 
 import (
-	"context"
-	"fmt"
 	"go/ast"
 	"go/token"
+	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,11 +24,12 @@ type Config struct {
 	FlagSymbols []string `env:"FLAG_SYMBOLS" env-required:"true"`
 
 	// Cutoff date for when a flag is considered old
-	Cutoff time.Time `env:"CUTOFF" env-default:"2019-01-01T00:00:00Z"`
+	Cutoff time.Time `env:"CUTOFF" env-required:"true"`
 
 	// Log level to log at
 	LogLevel loglevel `env:"LOG_LEVEL" env-default:"info"`
 
+	// Path to the git repo. Defaults to the current directory.
 	RepoPath string `env:"REPO_PATH" env-default:"."`
 }
 
@@ -60,11 +61,16 @@ var Analyzer *analysis.Analyzer = &analysis.Analyzer{
 }
 
 func Initialize(cfg Config) {
+	// Get the full path to the repo
+	repoPath, err := filepath.Abs(cfg.RepoPath)
+	if err != nil {
+		panic(err)
+	}
+	cfg.RepoPath = repoPath
 	r.cfg = cfg
+
 	r.l = log.Logger.Level(zerolog.Level(cfg.LogLevel))
 }
-
-const Cutoff = "yeet"
 
 func (r *runner) run(pass *analysis.Pass) (any, error) {
 	r.l.Debug().Str("package", pass.Pkg.Name()).Msg("Running flagexorcist on package")
@@ -79,37 +85,39 @@ func (r *runner) run(pass *analysis.Pass) (any, error) {
 	identifiers := r.findFlagIdents(pass)
 
 	// sort these into declarations and usages
-	declarationsAndCommitTimes := map[*ast.Ident]time.Time{}
+	declarationCommitTimes := map[string]time.Time{}
 	usagesByFlag := map[string][]*ast.Ident{}
 	for _, id := range identifiers {
-		if isDeclaration(id) {
+		if isDeclaration(id) && !hasKey(declarationCommitTimes, id.Name) {
 			timeCommitted := r.timeCommitted(repo, id.Name, pass.Fset.Position(id.NamePos))
 			if t := timeCommitted.OrEmpty(); !t.IsZero() {
-				declarationsAndCommitTimes[id] = t
+				declarationCommitTimes[id.Name] = t
 			}
 		} else {
 			usagesByFlag[id.Name] = append(usagesByFlag[id.Name], id)
 		}
 	}
 
-	if time.Now() == r.cfg.Cutoff {
-		r.l.Debug().Msg("Cutoff is now")
-	}
-
-	if Cutoff == "yeet" {
-		r.l.Debug().Msg("Cutoff is yeet")
-	}
-
 	// We complain if any used symbol is very old
-	for id, committedAt := range declarationsAndCommitTimes {
-		usages, ok := usagesByFlag[id.Name]
+	for symbol, committedAt := range declarationCommitTimes {
+		usages, ok := usagesByFlag[symbol]
 		if !ok {
 			continue
 		}
 
-		for _, usage := range usages {
-			if committedAt.Before(r.cfg.Cutoff) {
-				pass.Reportf(usage.Pos(), "flag '%v', added on %v, was used on after %v", id.Name, committedAt, r.cfg.Cutoff)
+		r.l.Debug().
+			Time("committedAt", committedAt).
+			Time("cutoff", r.cfg.Cutoff).
+			Str("symbol", symbol).
+			Msg("Checking if flag is old")
+		if committedAt.Before(r.cfg.Cutoff) {
+			for _, usage := range usages {
+				pass.Reportf(
+					usage.Pos(),
+					"Flag '%v', added on %v, was used on or after %s. Consider removing it.",
+					symbol, committedAt.Format("2006-01-02"),
+					r.cfg.Cutoff.Format("2006-01-02"),
+				)
 			}
 		}
 
@@ -172,7 +180,9 @@ func isDeclaration(ident *ast.Ident) bool {
 func (r *runner) timeCommitted(
 	repo *git.Repository, symbol string, pos token.Position,
 ) mo.Option[time.Time] {
-	iter, err := repo.Log(&git.LogOptions{Until: &r.cfg.Cutoff})
+	iter, err := repo.Log(&git.LogOptions{
+		// Until: &r.cfg.Cutoff, // TODO: reinstate this
+	})
 	if err != nil {
 		panic(err) // TODO:
 		return mo.None[time.Time]()
@@ -181,34 +191,38 @@ func (r *runner) timeCommitted(
 	timestamp := mo.None[time.Time]()
 
 	iter.ForEach(func(commit *object.Commit) error {
-		// Get the list of files changed in this commit
-		patch, err := commit.PatchContext(context.Background(), commit)
+		var file *object.File
+		iter, err := commit.Files()
 		if err != nil {
 			return err
 		}
 
-		// Search for the given file in the list of changed files
-		var file *object.File
-		for _, f := range patch.Stats() {
-			if f.Name == pos.Filename {
-				file, err = commit.File(f.Name)
-				if err != nil {
-					return err
-				}
-				break
+		// Chop off everything before the base of the repo path to compare just
+		// the relative path.
+		searchFileName := strings.TrimPrefix(pos.Filename, r.cfg.RepoPath+"/")
+		err = iter.ForEach(func(f *object.File) error {
+			if f.Name == searchFileName {
+				file = f
+				return io.EOF
 			}
-		}
+			return nil
+		})
 
 		// If the file is found, search for the symbol within the file
 		if file != nil {
+			// TODO: we should only check changes to the file, not the whole file
 			contents, err := file.Contents()
 			if err != nil {
 				return err
 			}
 			if strings.Contains(contents, symbol) {
 				// The symbol was found in this commit, so return the commit timestamp
-				fmt.Printf("Symbol found in commit %v\n", commit.Hash)
-				fmt.Printf("Symbol was added on %v\n", commit.Author.When)
+				r.l.Debug().
+					Str("symbol", symbol).
+					Str("file", pos.Filename).
+					Str("commit", commit.Hash.String()).
+					Str("when", commit.Author.When.String()).
+					Msg("Symbol found in commit")
 				timestamp = mo.Some[time.Time](commit.Author.When)
 				return nil
 			}
@@ -218,4 +232,9 @@ func (r *runner) timeCommitted(
 	})
 
 	return timestamp
+}
+
+func hasKey[K comparable, V any](m map[K]V, k K) bool {
+	_, ok := m[k]
+	return ok
 }
