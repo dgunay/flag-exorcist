@@ -3,11 +3,9 @@ module github.com/dgunay/flag-exorcist
 go 1.20
 
 require (
-	github.com/go-git/go-git v4.7.0+incompatible
 	github.com/go-git/go-git/v5 v5.6.1
 	github.com/ilyakaznacheev/cleanenv v1.4.2
 	github.com/pkg/errors v0.9.1
-	github.com/rotisserie/eris v0.5.4
 	github.com/rs/zerolog v1.29.1
 	github.com/samber/mo v1.8.0
 	golang.org/x/tools v0.8.0
@@ -36,7 +34,6 @@ require (
 	golang.org/x/mod v0.10.0 // indirect
 	golang.org/x/net v0.9.0 // indirect
 	golang.org/x/sys v0.7.0 // indirect
-	gopkg.in/src-d/go-git.v4 v4.13.1 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	olympos.io/encoding/edn v0.0.0-20201019073823-d3554ca0b0a3 // indirect
