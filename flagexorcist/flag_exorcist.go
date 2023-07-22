@@ -23,8 +23,8 @@ type Config struct {
 	// The symbols that the user wants to look at
 	FlagSymbols []string `env:"FLAG_SYMBOLS" env-required:"true"`
 
-	// Cutoff date for when a flag is considered old
-	Cutoff time.Time `env:"CUTOFF" env-required:"true"`
+	// Cutoff duration for how old a flag can be before we complain about it
+	Cutoff time.Duration `env:"CUTOFF" env-required:"true"`
 
 	// Log level to log at
 	LogLevel loglevel `env:"LOG_LEVEL" env-default:"info"`
@@ -107,16 +107,16 @@ func (r *runner) run(pass *analysis.Pass) (any, error) {
 
 		r.l.Debug().
 			Time("committedAt", committedAt).
-			Time("cutoff", r.cfg.Cutoff).
+			Dur("cutoff", r.cfg.Cutoff).
 			Str("symbol", symbol).
 			Msg("Checking if flag is old")
-		if committedAt.Before(r.cfg.Cutoff) {
+		if committedAt.Before(time.Now().Add(-r.cfg.Cutoff)) {
 			for _, usage := range usages {
 				pass.Reportf(
 					usage.Pos(),
-					"Flag '%v', added on %v, was used on or after %s. Consider removing it.",
+					"Flag '%v', added on %v, is more than %v days old",
 					symbol, committedAt.Format("2006-01-02"),
-					r.cfg.Cutoff.Format("2006-01-02"),
+					r.cfg.Cutoff.Hours()/24,
 				)
 			}
 		}
