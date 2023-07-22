@@ -27,20 +27,20 @@ type Config struct {
 	Cutoff time.Duration `env:"CUTOFF" env-required:"true"`
 
 	// Log level to log at
-	LogLevel loglevel `env:"LOG_LEVEL" env-default:"info"`
+	LogLevel LogLevel `env:"LOG_LEVEL" env-default:"info"`
 
 	// Path to the git repo. Defaults to the current directory.
 	RepoPath string `env:"REPO_PATH" env-default:"."`
 }
 
-type loglevel zerolog.Level
+type LogLevel zerolog.Level
 
-func (l *loglevel) SetValue(s string) error {
+func (l *LogLevel) SetValue(s string) error {
 	lvl, err := zerolog.ParseLevel(s)
 	if err != nil {
 		return err
 	}
-	*l = loglevel(lvl)
+	*l = LogLevel(lvl)
 	return nil
 }
 
